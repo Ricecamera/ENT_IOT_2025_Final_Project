@@ -1,3 +1,5 @@
+import os
+import sys
 import cv2
 import numpy as np
 import time
@@ -9,11 +11,20 @@ from datetime import datetime
 from pathlib import Path
 from PIL import Image
 from flask import Flask, Response, render_template_string, request, jsonify
-from snpehelper_manager import PerfProfile, Runtime, SnpeContext
+
 
 # =============================================================================
 # SCRFD Face Detection Logic
 # =============================================================================
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from snpehelper_manager import PerfProfile, Runtime, SnpeContext
+except ImportError as e:
+    print(f"Error importing SNPE-Helper modules: {e}")
+    sys.exit(1)
 
 class SCRFD(SnpeContext):
     """
@@ -1260,7 +1271,7 @@ def main():
     parser = argparse.ArgumentParser(description='Web-Based Face Recognition System')
     parser.add_argument('--camera', type=int, default=0, help='Camera ID')
     parser.add_argument('--db-path', default='face_database', help='Database directory')
-    parser.add_argument('--scrfd-dlc', default='../SCRFD (Face Detection)/Model/scrfd_quantized_6490.dlc')
+    parser.add_argument('--scrfd-dlc', default='../SCRFD (Face Detection)/Model/scrfd.dlc')
     parser.add_argument('--arcface-dlc', default='../ArcFace (Face Recognition)/Model/arcface_quantized_6490.dlc')
     parser.add_argument('--runtime', default='DSP', choices=['CPU', 'DSP'])
     parser.add_argument('--threshold', type=float, default=0.4, help='Similarity threshold')

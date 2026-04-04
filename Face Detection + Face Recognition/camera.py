@@ -7,6 +7,7 @@ import os
 import sys
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) # parent dir of this folder
 
 try:
     from web import SCRFD, ArcFace, FaceDatabase
@@ -19,7 +20,7 @@ def main():
     parser = argparse.ArgumentParser(description='Live Webcam Face Recognition (Local Window)')
     parser.add_argument('--camera', type=int, default=0, help='Camera ID (default: 0)')
     parser.add_argument('--db-path', default='face_database', help='Database directory')
-    parser.add_argument('--scrfd-dlc', default='../SCRFD (Face Detection)/Model/scrfd_quantized_6490.dlc', help='Path to SCRFD DLC')
+    parser.add_argument('--scrfd-dlc', default='../SCRFD (Face Detection)/Model/scrfd.dlc', help='Path to SCRFD DLC')
     parser.add_argument('--arcface-dlc', default='../ArcFace (Face Recognition)/Model/arcface_quantized_6490.dlc', help='Path to ArcFace DLC')
     parser.add_argument('--runtime', default='DSP', choices=['CPU', 'DSP'], help='SNPE Runtime (CPU/DSP)')
     parser.add_argument('--threshold', type=float, default=0.4, help='Recognition similarity threshold')
