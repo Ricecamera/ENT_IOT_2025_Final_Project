@@ -47,3 +47,8 @@ venv.bak/
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
+
+# ignore face detection database
+database/
+face_database/
+uploads/
