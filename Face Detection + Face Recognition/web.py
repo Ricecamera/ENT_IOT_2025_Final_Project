@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import cv2
 import numpy as np
@@ -357,9 +358,11 @@ class FaceDatabase:
             'is_counted': is_new_day
         })
         
-        # ขยายเพดานการเก็บ Log เพื่อให้ทำกราฟ 30 วันได้ (เก็บ 5000 รายการล่าสุด)
-        if len(self.logs) > 5000:
-            self.logs = self.logs[-5000:]
+        # เมื่อ Log ถึง 10,000 รายการ ให้ตัดเหลือเฉพาะ 30 วันล่าสุด (ป้องกันไฟล์ใหญ่เกินไป)
+        if len(self.logs) >= 10000:
+            cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+            self.logs = [log for log in self.logs
+                         if log['timestamp'].split(' ')[0] >= cutoff]
 
         self.metadata[person_id]['last_checkin'] = current_time
         self.save()
@@ -396,6 +399,7 @@ class FaceDatabase:
 app = Flask(__name__)
 output_frame = None
 lock = threading.Lock()
+db_lock = threading.Lock()
 face_results = []
 system_ready = False
 
@@ -988,13 +992,13 @@ def detection_thread(camera_id, scrfd, arcface, db, skip_frames=1, threshold=0.5
                     for face in faces:
                         if face['identified'] and len(face['matches']) > 0:
                             person_id = face['matches'][0]['person_id']
-                            
+
                             last_checked = checkin_cooldowns.get(person_id, 0)
                             if current_time - last_checked > COOLDOWN_SECONDS:
-                                db.record_checkin(person_id)
-                                checkin_cooldowns[person_id] = current_time 
-                                
-                                meta = db.metadata.get(person_id, {})
+                                with db_lock:
+                                    db.record_checkin(person_id)
+                                    checkin_cooldowns[person_id] = current_time
+                                    meta = db.metadata.get(person_id, {})
                                 face['matches'][0]['checkin_count'] = meta.get('checkin_count')
                                 face['matches'][0]['last_checkin'] = meta.get('last_checkin')
                     # --------------------------------
@@ -1040,11 +1044,18 @@ def generate_frames():
     while True:
         with lock:
             if output_frame is None:
-                time.sleep(0.1)
-                continue
-            (flag, encoded_image) = cv2.imencode(".jpg", output_frame)
-            if not flag:
-                continue
+                frame_copy = None
+            else:
+                frame_copy = output_frame.copy()
+
+        if frame_copy is None:
+            time.sleep(0.1)   # sleep OUTSIDE lock
+            continue
+
+        flag, encoded_image = cv2.imencode(".jpg", frame_copy)
+        if not flag:
+            continue
+
         yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encoded_image) + b'\r\n')
         time.sleep(0.033)
 
@@ -1061,7 +1072,7 @@ def video_feed():
 
 @app.route('/get_faces')
 def get_faces():
-    global face_results, lock, database
+    global face_results, lock, database, db_lock
     with lock:
         faces = [
             {
@@ -1069,54 +1080,62 @@ def get_faces():
                 'detection_score': f['detection_score'],
                 'matches': f['matches'],
                 'identified': f['identified'],
-                'embedding': f['embedding'].tolist() 
+                'embedding': f['embedding'].tolist()
             }
             for f in face_results
         ]
-        
-    return jsonify({ 
-        'faces': faces, 
-        'db_size': len(database),
-        'logs': database.logs[-10:] # ส่ง 10 รายการล่าสุดไปแสดงบนเว็บตรง Live feed
+
+    with db_lock:
+        db_size = len(database)
+        recent_logs = list(database.logs[-10:])
+
+    return jsonify({
+        'faces': faces,
+        'db_size': db_size,
+        'logs': recent_logs
     })
 
 
 # API ใหม่สำหรับดึงข้อมูลสรุป 30 วัน
 @app.route('/api/dashboard')
 def api_dashboard():
-    global database, lock
-    
-    # คำนวณวันที่ย้อนหลัง 30 วัน
+    global database, db_lock
+
+    # Snapshot logs under db_lock, release immediately — do heavy work outside lock
+    with db_lock:
+        logs_snapshot = list(database.logs)
+
     today = datetime.now().date()
     last_30_days = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(29, -1, -1)]
-    
-    # สร้าง Dictionary ไว้เก็บยอดเริ่มต้นที่ 0
     daily_counts = {date: 0 for date in last_30_days}
-    
-    with lock:
-        # วนลูปอ่าน Log ทั้งหมดเพื่อบวกยอด
-        for log in database.logs:
-            # นับเฉพาะ Log ที่เป็นยอดเข้างานวันใหม่ (is_counted = True)
-            if log.get('is_counted', False):
-                date_str = log['timestamp'].split(' ')[0]
-                if date_str in daily_counts:
-                    daily_counts[date_str] += 1
-                    
-    # แปลงกลับเป็น List ให้พร้อมส่งขึ้นเว็บ
+
+    for log in logs_snapshot:
+        if log.get('is_counted', False):
+            date_str = log['timestamp'].split(' ')[0]
+            if date_str in daily_counts:
+                daily_counts[date_str] += 1
+
     result = [{"date": d, "count": c} for d, c in daily_counts.items()]
     return jsonify(result)
 
 
 @app.route('/enroll', methods=['POST'])
 def enroll():
-    global database
+    global database, db_lock
     data = request.json
-    name = data.get('name')
-    person_id = data.get('person_id')
+    if not data:
+        return jsonify({'success': False, 'error': 'No JSON body'}), 400
+
+    name = data.get('name', '').strip()
+    person_id = data.get('person_id', '')
     embedding_list = data.get('embedding')
 
-    if not name or not embedding_list:
-        return jsonify({'success': False, 'error': 'Missing face data or name'})
+    if not name or len(name) > 100:
+        return jsonify({'success': False, 'error': 'Invalid name (1-100 chars)'}), 400
+    if not person_id or not re.match(r'^[\w\-]{1,64}$', person_id):
+        return jsonify({'success': False, 'error': 'Invalid person_id'}), 400
+    if not embedding_list or not isinstance(embedding_list, list):
+        return jsonify({'success': False, 'error': 'Missing embedding'}), 400
 
     try:
         embedding = np.array(embedding_list, dtype=np.float32)
@@ -1124,13 +1143,14 @@ def enroll():
         if norm > 0:
             embedding = embedding / norm
 
-        database.add_person(person_id, name, embedding, None)
-        database.record_checkin(person_id) 
-        
-        return jsonify({ 'success': True, 'person_id': person_id, 'name': name })
+        with db_lock:
+            database.add_person(person_id, name, embedding, None)
+            database.record_checkin(person_id)
+
+        return jsonify({'success': True, 'person_id': person_id, 'name': name})
     except Exception as e:
         print(f"Backend error during enrollment: {e}")
-        return jsonify({'success': False, 'error': str(e)})
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 def main():
@@ -1179,9 +1199,9 @@ def main():
 
     arcface_model = ArcFace(
         dlc_path=args.arcface_dlc,
-        input_layers=["input_1"],
-        output_layers=["embedding"],
-        output_tensors=["embedding"],
+        input_layers=["data"],
+        output_layers=["pre_fc1"],
+        output_tensors=["fc1"],
         runtime=runtime,
         profile_level=PerfProfile.BURST
     )

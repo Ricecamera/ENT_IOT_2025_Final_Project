@@ -10,8 +10,8 @@ base_script_dir="./Face Detection + Face Recognition"
 python "${base_script_dir}/web.py" \
     --db-path "${base_script_dir}/face_database" \
     --scrfd-dlc "./SCRFD (Face Detection)/Model/scrfd.dlc" \
-    --arcface-dlc "./ArcFace (Face Recognition)/Model/arcface.dlc" \
-    --threshold 0.97 \
+    --arcface-dlc "./ArcFace (Face Recognition)/Model/arcfaceresnet100.dlc" \
+    --threshold 0.99 \
     --skip-frames 2 \
     --runtime DSP \
     --port 5000 # Port for the web interface (default: 5000)
