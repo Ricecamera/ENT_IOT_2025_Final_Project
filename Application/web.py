@@ -924,8 +924,14 @@ def detection_thread(camera_id, scrfd, arcface, db, skip_frames=1, threshold=0.5
     frame_count = 0
     last_faces = []
     
+    fps = 0.0
+    fps_frame_count = 0
+    fps_start_time = time.time()
+
     checkin_cooldowns = {} 
     COOLDOWN_SECONDS = 5 
+
+    os.makedirs("debug_faces", exist_ok=True)
 
     try:
         while True:
@@ -933,6 +939,7 @@ def detection_thread(camera_id, scrfd, arcface, db, skip_frames=1, threshold=0.5
             if not ret:
                 time.sleep(0.1)
                 continue
+            # print("image size:", frame.shape)
 
             frame_count += 1
 
@@ -951,10 +958,11 @@ def detection_thread(camera_id, scrfd, arcface, db, skip_frames=1, threshold=0.5
                         if x2 > x1 and y2 > y1:
                             aligned_face = arcface.align_face(frame, det['landmarks'])
                             if aligned_face is None:
-                                aligned_face = cv2.resize(frame[y1:y2, x1:x2], (112, 112))
+                                aligned_face = cv2.resize(frame[y1:y2, x1:x2], (112, 112))                      
                             
                             embedding = arcface.get_embedding(aligned_face)
                             if embedding is not None:
+                                norm = np.linalg.norm(embedding)
                                 matches = db.search(embedding, threshold=threshold, top_k=1)
 
                                 faces.append({
@@ -1028,6 +1036,16 @@ def detection_thread(camera_id, scrfd, arcface, db, skip_frames=1, threshold=0.5
 
                 for lx, ly in face['landmarks']:
                     cv2.circle(annotated, (int(lx), int(ly)), 2, (255, 0, 0), -1)
+
+            # Calculate and draw FPS
+            fps_frame_count += 1
+            elapsed = time.time() - fps_start_time
+            if elapsed >= 1.0:
+                fps = fps_frame_count / elapsed
+                fps_frame_count = 0
+                fps_start_time = time.time()
+            cv2.putText(annotated, f"FPS: {fps:.1f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
             with lock:
                 output_frame = annotated.copy()

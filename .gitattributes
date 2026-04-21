@@ -1,2 +1,2 @@
-ArcFace[[:space:]](Face[[:space:]]Recognition)/Model/arcface_quantized_6490.dlc filter=lfs diff=lfs merge=lfs -text
-ArcFace[[:space:]](Face[[:space:]]Recognition)/Model/arcfaceresnet100.dlc filter=lfs diff=lfs merge=lfs -text
+ArcFace/Model/arcface_quantized_6490.dlc filter=lfs diff=lfs merge=lfs -text
+ArcFace/Model/arcfaceresnet100.dlc filter=lfs diff=lfs merge=lfs -text
