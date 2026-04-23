@@ -6,8 +6,10 @@ from snpehelper_manager import PerfProfile, Runtime, SnpeContext
 import argparse
 import sys
 
+# =============================================================================
+# SCRFD Face Detection Logic (SNPE)
+# =============================================================================
 class SCRFD(SnpeContext):
-
     def __init__(self, dlc_path: str = "None",
                  input_layers: list = [],
                  output_layers: list = [],
@@ -17,7 +19,7 @@ class SCRFD(SnpeContext):
                  enable_cache: bool = False,
                  input_size: tuple = (320, 320),
                  conf_threshold: float = 0.5,
-                 nms_threshold: float = 0.4):
+                 nms_threshold: float = 0.4):    
         super().__init__(dlc_path, input_layers, output_layers, output_tensors,
                         runtime, profile_level, enable_cache)
 
@@ -26,7 +28,7 @@ class SCRFD(SnpeContext):
         self.nms_threshold = nms_threshold
 
         self.feat_stride_fpn = [8, 16, 32]
-        self.num_anchors = 2 
+        self.num_anchors = 2
 
         self._anchor_centers = {}
         self._num_anchors = {}
@@ -169,7 +171,6 @@ class SCRFD(SnpeContext):
             bboxes = bboxes[keep]
             scores = scores[keep]
             kps = kps[keep]
-        
         scale_x = self.orig_shape[1] / self.input_size[1]
         scale_y = self.orig_shape[0] / self.input_size[0]
 

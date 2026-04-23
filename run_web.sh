@@ -8,11 +8,11 @@ export PYTHONPATH="${PWD}:${PWD}/Application:${PYTHONPATH}"
 # python --version
 
 base_script_dir="./Application"
-python3.10 "${base_script_dir}/web.py" \
+python3.10 "${base_script_dir}/web_facenet.py" \
     --camera 2 \
     --db-path "${base_script_dir}/face_database" \
     --scrfd-dlc "./SCRFD/Model/scrfd.dlc" \
-    --arcface-dlc "./ArcFace/Model/arcface_quantized_6490.dlc" \
+    --facenet-dlc "./MobileFacenet/Model/mobileface_net.dlc" \
     --threshold 0.5 \
     --skip-frames 2 \
     --runtime DSP \

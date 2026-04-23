@@ -15,9 +15,11 @@ import pytz
 
 import torch
 from torchvision import transforms
-from facenet_pytorch import InceptionResnetV1
+from MobileFacenet.mobilefacenet import MobileFacenet
+from SCRFD.scrfd import SCRFD
 
 from flask import Flask, Response, render_template, request, jsonify 
+from face_database import FaceDatabase
 
 try:
     import mediapipe as mp
@@ -35,322 +37,6 @@ except ImportError as e:
     sys.exit(1)
 
 LOCAL_TZ = pytz.timezone('Asia/Bangkok')
-# =============================================================================
-# SCRFD Face Detection Logic (SNPE)
-# =============================================================================
-class SCRFD(SnpeContext):
-    def __init__(self, dlc_path: str = "None",
-                 input_layers: list = [],
-                 output_layers: list = [],
-                 output_tensors: list = [],
-                 runtime: str = Runtime.CPU,
-                 profile_level: str = PerfProfile.BALANCED,
-                 enable_cache: bool = False,
-                 input_size: tuple = (320, 320),
-                 conf_threshold: float = 0.5,
-                 nms_threshold: float = 0.4):
-        
-        super().__init__(dlc_path, input_layers, output_layers, output_tensors,
-                        runtime, profile_level, enable_cache)
-
-        self.input_size = input_size
-        self.conf_threshold = conf_threshold
-        self.nms_threshold = nms_threshold
-
-        self.feat_stride_fpn = [8, 16, 32]
-        self.num_anchors = 2
-
-        self._anchor_centers = {}
-        self._num_anchors = {}
-        for stride in self.feat_stride_fpn:
-            feat_h = input_size[0] // stride
-            feat_w = input_size[1] // stride
-            self._num_anchors[stride] = feat_h * feat_w * self.num_anchors
-
-            anchor_centers = np.stack(np.mgrid[:feat_h, :feat_w][::-1], axis=-1)
-            anchor_centers = anchor_centers.astype(np.float32)
-            anchor_centers = (anchor_centers * stride).reshape((-1, 2))
-
-            anchor_centers = np.stack([anchor_centers] * self.num_anchors, axis=1)
-            anchor_centers = anchor_centers.reshape((-1, 2))
-            self._anchor_centers[stride] = anchor_centers
-
-    def preprocess(self, image):
-        if isinstance(image, Image.Image):
-            image = np.array(image)
-
-        self.orig_shape = image.shape[:2]
-
-        input_image = cv2.resize(image, (self.input_size[1], self.input_size[0]))
-
-        if len(input_image.shape) == 3 and input_image.shape[2] == 3:
-            input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
-
-        input_image = input_image.astype(np.float32)
-        input_image = (input_image - 127.5) / 128.0
-
-        input_image_flat = input_image.flatten()
-        self.SetInputBuffer(input_image_flat, "input.1")
-
-    def distance2bbox(self, points, distance, max_shape=None):
-        x1 = points[:, 0] - distance[:, 0]
-        y1 = points[:, 1] - distance[:, 1]
-        x2 = points[:, 0] + distance[:, 2]
-        y2 = points[:, 1] + distance[:, 3]
-
-        if max_shape is not None:
-            x1 = np.clip(x1, 0, max_shape[1])
-            y1 = np.clip(y1, 0, max_shape[0])
-            x2 = np.clip(x2, 0, max_shape[1])
-            y2 = np.clip(y2, 0, max_shape[0])
-
-        return np.stack([x1, y1, x2, y2], axis=-1)
-
-    def distance2kps(self, points, distance, max_shape=None):
-        preds = []
-        for i in range(0, distance.shape[1], 2):
-            px = points[:, 0] + distance[:, i]
-            py = points[:, 1] + distance[:, i + 1]
-
-            if max_shape is not None:
-                px = np.clip(px, 0, max_shape[1])
-                py = np.clip(py, 0, max_shape[0])
-
-            preds.append(np.stack([px, py], axis=-1))
-
-        return np.stack(preds, axis=1)
-
-    def nms(self, dets, scores):
-        x1 = dets[:, 0]
-        y1 = dets[:, 1]
-        x2 = dets[:, 2]
-        y2 = dets[:, 3]
-
-        areas = (x2 - x1 + 1) * (y2 - y1 + 1)
-        order = scores.argsort()[::-1]
-
-        keep = []
-        while order.size > 0:
-            i = order[0]
-            keep.append(i)
-
-            xx1 = np.maximum(x1[i], x1[order[1:]])
-            yy1 = np.maximum(y1[i], y1[order[1:]])
-            xx2 = np.minimum(x2[i], x2[order[1:]])
-            yy2 = np.minimum(y2[i], y2[order[1:]])
-
-            w = np.maximum(0.0, xx2 - xx1 + 1)
-            h = np.maximum(0.0, yy2 - yy1 + 1)
-            inter = w * h
-
-            ovr = inter / (areas[i] + areas[order[1:]] - inter)
-
-            inds = np.where(ovr <= self.nms_threshold)[0]
-            order = order[inds + 1]
-
-        return keep
-
-    def postprocess(self):
-        output_mapping = {
-            8: {'score': '446', 'bbox': '449', 'kps': '452'},
-            16: {'score': '466', 'bbox': '469', 'kps': '472'},
-            32: {'score': '486', 'bbox': '489', 'kps': '492'}
-        }
-
-        all_bboxes = []
-        all_scores = []
-        all_kps = []
-
-        for stride in self.feat_stride_fpn:
-            mapping = output_mapping[stride]
-            num_pred = self._num_anchors[stride]
-
-            score_output = self.GetOutputBuffer(mapping['score'])
-            bbox_output = self.GetOutputBuffer(mapping['bbox'])
-            kps_output = self.GetOutputBuffer(mapping['kps'])
-
-            scores = score_output.reshape((num_pred, 1))
-            bboxes = bbox_output.reshape((num_pred, 4))
-            kps = kps_output.reshape((num_pred, 10))
-
-            anchor_centers = self._anchor_centers[stride]
-
-            bboxes = bboxes * stride
-            pos_bboxes = self.distance2bbox(anchor_centers, bboxes)
-
-            kps = kps * stride
-            pos_kps = self.distance2kps(anchor_centers, kps)
-
-            all_bboxes.append(pos_bboxes)
-            all_scores.append(scores)
-            all_kps.append(pos_kps)
-
-        all_bboxes = np.vstack(all_bboxes)
-        all_scores = np.vstack(all_scores).squeeze()
-        all_kps = np.vstack(all_kps)
-
-        valid_mask = all_scores > self.conf_threshold
-        bboxes = all_bboxes[valid_mask]
-        scores = all_scores[valid_mask]
-        kps = all_kps[valid_mask]
-
-        if len(bboxes) > 0:
-            keep = self.nms(bboxes, scores)
-            bboxes = bboxes[keep]
-            scores = scores[keep]
-            kps = kps[keep]
-
-        scale_x = self.orig_shape[1] / self.input_size[1]
-        scale_y = self.orig_shape[0] / self.input_size[0]
-
-        detections = []
-        for bbox, score, kp in zip(bboxes, scores, kps):
-            detection = {
-                'bbox': [
-                    bbox[0] * scale_x,
-                    bbox[1] * scale_y,
-                    bbox[2] * scale_x,
-                    bbox[3] * scale_y
-                ],
-                'score': float(score),
-                'landmarks': kp * np.array([scale_x, scale_y])
-            }
-            detections.append(detection)
-
-        return detections
-
-
-# =============================================================================
-# FaceNet Face Recognition Logic (Deep Metric Learning)
-# =============================================================================
-class FaceNet_Model:
-    def __init__(self, input_size=(160, 160)):
-        self.input_size = input_size
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
-        print(f"Loading FaceNet model on {self.device}...")
-        self.model = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
-        
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        ])
-
-    def align_face(self, img, landmarks):
-        src_pts = np.array([
-            [54.7065, 73.8514], [105.0454, 73.5734],
-            [80.0360, 102.4808], [59.3561, 131.9507], [101.0427, 131.7201] 
-        ], dtype=np.float32)
-        
-        dst_pts = np.array(landmarks, dtype=np.float32)
-        
-        tform, _ = cv2.estimateAffinePartial2D(dst_pts, src_pts, method=cv2.LMEDS)
-        if tform is None: return None
-            
-        return cv2.warpAffine(img, tform, self.input_size, borderValue=0.0)
-
-    def get_embedding(self, face_image):
-        if isinstance(face_image, Image.Image):
-            face_image = np.array(face_image)
-
-        rgb_face = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
-        face_tensor = self.transform(rgb_face).unsqueeze(0).to(self.device)
-        
-        with torch.no_grad():
-            embedding = self.model(face_tensor).cpu().numpy().flatten()
-            
-        embedding = embedding / np.linalg.norm(embedding)
-        return embedding
-
-
-# =============================================================================
-# Face Database & Check-in / Log Logic
-# =============================================================================
-class FaceDatabase:
-    def __init__(self, db_path="face_database"):
-        self.db_path = Path(db_path)
-        self.db_path.mkdir(exist_ok=True)
-        self.metadata_file = self.db_path / "metadata.json"
-        self.embeddings_file = self.db_path / "embeddings.pkl"
-        self.log_file = self.db_path / "checkin_log.json"
-        
-        self.metadata = {}
-        self.embeddings = {}
-        self.logs = []
-        
-        self.load()
-
-    def load(self):
-        if self.metadata_file.exists():
-            with open(self.metadata_file, 'r') as f:
-                self.metadata = json.load(f)
-        if self.embeddings_file.exists():
-            with open(self.embeddings_file, 'rb') as f:
-                self.embeddings = pickle.load(f)
-        if self.log_file.exists():
-            with open(self.log_file, 'r') as f:
-                self.logs = json.load(f)
-
-    def save(self):
-        with open(self.metadata_file, 'w') as f: json.dump(self.metadata, f, indent=2)
-        with open(self.embeddings_file, 'wb') as f: pickle.dump(self.embeddings, f)
-        with open(self.log_file, 'w') as f: json.dump(self.logs, f, indent=2)
-
-    def add_person(self, person_id, name, embedding, image_path=None):
-        self.metadata[person_id] = {
-            'name': name, 'enrolled_at': datetime.now().isoformat(),
-            'checkin_count': 0, 'last_checkin': None,
-            'image_path': str(image_path) if image_path else None
-        }
-        self.embeddings[person_id] = embedding
-        self.save()
-        return True
-
-    def record_checkin(self, person_id):
-        if person_id not in self.metadata: return False
-        now = datetime.now(LOCAL_TZ)
-        current_date, current_time = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d %H:%M:%S")
-        
-        last_checkin_str = self.metadata[person_id].get('last_checkin')
-        is_new_day = True
-        if last_checkin_str and last_checkin_str.split(' ')[0] == current_date:
-            is_new_day = False
-
-        if is_new_day:
-            self.metadata[person_id]['checkin_count'] = self.metadata[person_id].get('checkin_count', 0) + 1
-            
-        self.logs.append({
-            'person_id': person_id, 'name': self.metadata[person_id]['name'],
-            'timestamp': current_time, 'is_counted': is_new_day
-        })
-        if len(self.logs) > 5000: self.logs = self.logs[-5000:]
-        
-        self.metadata[person_id]['last_checkin'] = current_time
-        self.save()
-        return is_new_day
-
-    def search(self, query_embedding, threshold=0.7, top_k=1):
-        if not self.embeddings: return []
-
-        matches = []
-        for person_id, db_embedding in self.embeddings.items():
-            similarity = np.dot(query_embedding, db_embedding)
-            
-            if similarity >= threshold: 
-                meta = self.metadata.get(person_id, {})
-                matches.append({
-                    'person_id': person_id,
-                    'name': meta.get('name', 'Unknown'),
-                    'similarity': float(similarity), 
-                    'checkin_count': meta.get('checkin_count', 0),
-                    'last_checkin': meta.get('last_checkin', 'Never'),
-                })
-        
-        matches.sort(key=lambda x: x['similarity'], reverse=True)
-        return matches[:top_k]
-
-    def __len__(self): return len(self.metadata)
-
 
 # =============================================================================
 # Web Application Logic
@@ -395,6 +81,9 @@ def detection_thread(camera_id, scrfd, face_model, db, skip_frames=1, threshold=
 
     frame_count = 0
     last_faces = []
+    fps = 0.0
+    fps_frame_count = 0
+    fps_start_time = time.time()
     
     checkin_cooldowns = {} 
     COOLDOWN_SECONDS = 5 
@@ -543,6 +232,16 @@ def detection_thread(camera_id, scrfd, face_model, db, skip_frames=1, threshold=
                             }
                         cv2.putText(annotated, "CAPTURED!", (30, 60),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 4)
+            
+            # Calculate and draw FPS
+            fps_frame_count += 1
+            elapsed = time.time() - fps_start_time
+            if elapsed >= 1.0:
+                fps = fps_frame_count / elapsed
+                fps_frame_count = 0
+                fps_start_time = time.time()
+            cv2.putText(annotated, f"FPS: {fps:.1f}", (520, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
             with lock:
                 output_frame = annotated.copy()
@@ -644,6 +343,29 @@ def enroll():
         print(f"Backend error during enrollment: {e}")
         return jsonify({'success': False, 'error': str(e)})
 
+@app.route('/api/persons/<person_id>', methods=['DELETE'])
+def delete_person(person_id):
+    """Delete a person from the database."""
+    global database
+    try:
+        success = database.remove_person(person_id)
+        if success:
+            return jsonify({'success': True, 'message': f'Person {person_id} deleted successfully'})
+        else:
+            return jsonify({'success': False, 'error': 'Person not found'}), 404
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/database/stats', methods=['GET'])
+def get_database_stats():
+    """Get database statistics."""
+    global database
+    try:
+        stats = database.get_statistics()
+        return jsonify({'success': True, 'stats': stats})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
 def main():
     global scrfd_model, facenet_model, database
 
@@ -651,6 +373,7 @@ def main():
     parser.add_argument('--camera', type=int, default=2, help='Camera ID')
     parser.add_argument('--db-path', default='face_database', help='Database directory')
     parser.add_argument('--scrfd-dlc', default='../SCRFD (Face Detection)/Model/scrfd.dlc')
+    parser.add_argument('--facenet-dlc', default='../MobileFacenet/Model/mobileface_net.dlc')
     parser.add_argument('--runtime', default='DSP', choices=['CPU', 'DSP'])
     parser.add_argument('--threshold', type=float, default=0.7, help='Cosine similarity threshold (FaceNet)')
     parser.add_argument('--skip-frames', type=int, default=1, help='Process every N frames')
@@ -687,18 +410,29 @@ def main():
         profile_level=PerfProfile.BURST
     )
 
+    recognition_model = MobileFacenet(
+        dlc_path=args.facenet_dlc,
+        input_layers=["input"],
+        output_layers=["/bn/BatchNormalization"],
+        output_tensors=["/bn/BatchNormalization_output_0"],
+        runtime="CPU", # FaceNet is not quantized, so we run it on CPU for better accuracy
+        profile_level=PerfProfile.BURST
+    )
+
     if not scrfd_model.Initialize():
         print("Error: Failed to initialize SCRFD!")
         return 1
 
-    facenet_model = FaceNet_Model()
+    if not recognition_model.Initialize():
+        print("Error: Failed to initialize MobileFace!")
+        return 1
 
     print("✓ Models initialized")
 
     print("\nStarting webcam detection...")
     detection_process = threading.Thread(
         target=detection_thread,
-        args=(args.camera, scrfd_model, facenet_model, database, args.skip_frames, args.threshold),
+        args=(args.camera, scrfd_model, recognition_model, database, args.skip_frames, args.threshold),
         daemon=True
     )
     detection_process.start()

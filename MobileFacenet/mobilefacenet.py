@@ -20,6 +20,24 @@ class MobileFacenet(SnpeContext):
 
         self.input_size = input_size
         self.embedding_dim = 512
+    
+    def align_face(self, img, landmarks):
+        src_pts = np.array([
+            [38.2946, 51.6963],
+            [73.5318, 51.5014],
+            [56.0252, 71.7366],
+            [41.5493, 92.3655],
+            [70.7299, 92.2041] 
+        ], dtype=np.float32)
+        
+        dst_pts = np.array(landmarks, dtype=np.float32)
+        
+        tform, _ = cv2.estimateAffinePartial2D(dst_pts, src_pts, method=cv2.LMEDS)
+        if tform is None:
+            return None
+            
+        aligned_face = cv2.warpAffine(img, tform, (112, 112), borderValue=0.0)
+        return aligned_face
 
     def preprocess(self, face_image):
         if isinstance(face_image, Image.Image):
@@ -29,7 +47,7 @@ class MobileFacenet(SnpeContext):
 
         if len(input_image.shape) == 3 and input_image.shape[2] == 3:
             input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
-        
+
         input_image = input_image.astype(np.float32)
         input_image = (input_image - 127.5) / 128.0
 
@@ -37,10 +55,8 @@ class MobileFacenet(SnpeContext):
         self.SetInputBuffer(input_image_flat, "input")
 
     def postprocess(self):
-        embedding = self.GetOutputBuffer("output")
-
+        embedding = self.GetOutputBuffer("/bn/BatchNormalization_output_0")
         embedding = embedding.reshape(self.embedding_dim)
-
         normalized_embedding = self.normalize_embedding(embedding)
 
         return {
