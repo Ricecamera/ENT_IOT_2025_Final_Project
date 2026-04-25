@@ -16,4 +16,4 @@ python3.10 "${base_script_dir}/web_facenet.py" \
     --threshold 0.5 \
     --skip-frames 2 \
     --runtime DSP \
-    --port 8080 # Port for the web interface (default: 5000)
+    --port 8080 

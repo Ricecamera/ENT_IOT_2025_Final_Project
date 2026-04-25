@@ -125,14 +125,6 @@ def detection_thread(camera_id, scrfd, face_model, db, skip_frames=1, threshold=
                 if scrfd.Execute():
                     detections = scrfd.postprocess()
 
-                    detections = sorted(
-                        detections, 
-                        key=lambda d: (d['bbox'][2] - d['bbox'][0]) * (d['bbox'][3] - d['bbox'][1]), 
-                        reverse=True
-                    )
-                    # ตัดเอาแค่ 4 หน้าแรกที่ใหญ่ที่สุด
-                    detections = detections[:4]
-
                     faces = []
                     for det in detections:
                         x1, y1, x2, y2 = [int(v) for v in det['bbox']]
@@ -186,6 +178,7 @@ def detection_thread(camera_id, scrfd, face_model, db, skip_frames=1, threshold=
                                 db.record_checkin(person_id)
                                 checkin_cooldowns[person_id] = current_time 
                                 meta = db.metadata.get(person_id, {})
+                                face['matches'][0]['checkin_count'] = meta.get('checkin_count')
                                 face['matches'][0]['last_checkin'] = meta.get('last_checkin')
 
                     last_faces = faces
@@ -271,6 +264,7 @@ def generate_frames():
                 continue
         yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encoded_image) + b'\r\n')
         time.sleep(0.033)
+now = datetime.now(LOCAL_TZ)
 
 @app.route('/')
 def index():
@@ -284,20 +278,10 @@ def video_feed():
 def get_faces():
     global face_results, lock, database, staged_auto_enroll
     
-    # คำนวณยอด Check-in ของแต่ละชื่อจาก Logs สดๆ (ป้องกันยอดใน Metadata เพี้ยน)
-    true_counts = {}
-    if hasattr(database, 'logs'):
-        for log in database.logs:
-            if log.get('is_counted', False):
-                n = log.get('name')
-                if n:
-                    true_counts[n] = true_counts.get(n, 0) + 1
-
     auto_data = None
     with lock:
-        faces = []
-        for f in face_results:
-            face_data = {
+        faces = [
+            {
                 'bbox': f['bbox'],
                 'detection_score': f['detection_score'],
                 'matches': f['matches'],
@@ -305,11 +289,8 @@ def get_faces():
                 'embedding': f['embedding'],
                 'face_image_b64': f.get('face_image_b64', '')
             }
-            # อัปเดตตัวเลขให้หน้าจอกล้องตรงกับความจริง
-            if f['identified'] and len(f['matches']) > 0:
-                name = f['matches'][0]['name']
-                face_data['matches'][0]['checkin_count'] = true_counts.get(name, 0)
-            faces.append(face_data)
+            for f in face_results
+        ]
         
         if staged_auto_enroll is not None:
             auto_data = staged_auto_enroll
@@ -355,47 +336,8 @@ def enroll():
     try:
         embedding = np.array(embedding_list, dtype=np.float32)
 
-        # 1. เช็คจาก Logs ว่าวันนี้ "ชื่อนี้" นับไปแล้วหรือยัง และดึงเวลาล่าสุดมา
-        today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
-        already_checked_in_today = False
-        last_checkin_time = None
-        
-        if hasattr(database, 'logs'):
-            for log in database.logs:
-                if log.get('name') == name:
-                    # อัปเดตเวลาล่าสุดไว้เสมอ
-                    if not last_checkin_time or log.get('timestamp') > last_checkin_time:
-                        last_checkin_time = log.get('timestamp')
-                        
-                    # ถ้าเจอว่ามีค่า true ในวันนี้แล้ว
-                    if log.get('is_counted', False) and log.get('timestamp', '').startswith(today_str):
-                        already_checked_in_today = True
-
-        # 2. บันทึกคนใหม่เข้า Database
         database.add_person(person_id, name, embedding, None)
-        
-        # 3. อัปเดตเฉพาะเวลาล่าสุด (Last Check-in) กลับเข้าไป เพื่อให้กล้องไม่นับเบิ้ล
-        if hasattr(database, 'metadata') and person_id in database.metadata:
-            if last_checkin_time:
-                database.metadata[person_id]['last_checkin'] = last_checkin_time
-                if hasattr(database, 'save_metadata'):
-                    database.save_metadata()
-
-        # 4. ถ้ายกเลิกลบแล้วเพิ่มใหม่ (Enroll) ระบบจะนับ Check-in ก็ต่อเมื่อวันนี้ยังไม่ได้ถูกนับเท่านั้น
-        if not already_checked_in_today:
-            database.record_checkin(person_id)
-        else:
-            # ถ้าวันนี้นับไปแล้ว (เช่น Arm เพิ่งเช็คอินไป แล้วโดนลบ แล้ว Enroll ใหม่)
-            if hasattr(database, 'logs'):
-                database.logs.append({
-                    'name': name,
-                    'timestamp': datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S"),
-                    'is_counted': False, 
-                    'person_id': person_id,
-                    'note': 'Re-enrolled but already checked in today'
-                })
-                if hasattr(database, 'save_logs'):
-                    database.save_logs()
+        database.record_checkin(person_id) 
         
         return jsonify({ 'success': True, 'person_id': person_id, 'name': name })
     except Exception as e:
@@ -413,56 +355,6 @@ def delete_person(person_id):
         else:
             return jsonify({'success': False, 'error': 'Person not found'}), 404
     except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/persons', methods=['GET'])
-def get_all_persons():
-    """Get a list of all enrolled persons with their ACCURATE check-in stats based on logs."""
-    global database
-    try:
-        # 1. ลิสต์รหัสคนที่ยังมีอยู่ในระบบปัจจุบัน (ยังไม่ถูกลบทิ้ง)
-        enrolled_persons = {}
-        if hasattr(database, 'metadata'):
-            for pid, meta in database.metadata.items():
-                name = meta.get('name', 'Unknown')
-                if name == 'Unknown' and hasattr(database, 'names') and isinstance(database.names, dict):
-                    name = database.names.get(pid, 'Unknown')
-                enrolled_persons[pid] = {
-                    'person_id': pid,
-                    'name': name,
-                    'checkin_count': 0,
-                    'last_checkin': 'No records'
-                }
-
-        # 2. นับยอดจริงๆ จากประวัติ Logs โดยยึด "ชื่อ" เป็นหลัก
-        true_stats = {}
-        if hasattr(database, 'logs'):
-            for log in database.logs:
-                n = log.get('name')
-                if not n: continue
-                if n not in true_stats:
-                    true_stats[n] = {'count': 0, 'last': 'No records'}
-                
-                # นับเฉพาะยอดที่ระบบให้ค่า True
-                if log.get('is_counted', False):
-                    true_stats[n]['count'] += 1
-                
-                # อัปเดตเวลาล่าสุดเสมอ
-                if log.get('timestamp') and (true_stats[n]['last'] == 'No records' or log.get('timestamp') > true_stats[n]['last']):
-                    true_stats[n]['last'] = log.get('timestamp')
-
-        # 3. จับคู่ข้อมูล Logs ที่ถูกต้อง ให้กับรายชื่อคนในระบบ
-        persons_list = []
-        for pid, pdata in enrolled_persons.items():
-            n = pdata['name']
-            if n in true_stats:
-                pdata['checkin_count'] = true_stats[n]['count']
-                pdata['last_checkin'] = true_stats[n]['last']
-            persons_list.append(pdata)
-
-        return jsonify({'success': True, 'persons': persons_list})
-    except Exception as e:
-        print(f"Error fetching persons API: {e}")
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/database/stats', methods=['GET'])
